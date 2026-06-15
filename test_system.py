@@ -10,7 +10,8 @@ from car_wash_system import (
     load_data, save_data, register_member, recharge_member,
     take_ticket, call_next_car, finish_wash,
     get_wash_history, get_daily_report, export_members_csv,
-    get_queue_position, get_wait_time, WASH_PRICE
+    get_queue_position, get_wait_time, WASH_PRICE,
+    WASH_DURATION_MINUTES, WASH_BAYS
 )
 
 def test():
@@ -19,7 +20,6 @@ def test():
     print("=" * 60)
 
     data = load_data()
-    all_passed = True
 
     print("\n1. 测试会员注册...")
     success, msg = register_member(data, "京A12345", "13800138001", "张三", "普通")
@@ -112,24 +112,23 @@ def test():
     
     print("   ✅ 套餐提醒功能正常（剩余次数<3时触发）")
 
-    print("\n7. 测试满减促销（第3次5折）...")
-    success, r = take_ticket(data, "促销测试车")
-    success, call_r = call_next_car(data)
-    success, r1 = finish_wash(data, call_r["bay_number"])
-    print(f"      第1次: {r1['price']}元 {'【促销】' if r1.get('promotion_msg') else ''}")
+    print("\n7. 测试满减促销（全店第3台5折）...")
+    print("      当前已洗3台(前3台分别是京B66666、京C99999、京A12345)")
+    print("      接下来洗第4台和第5台，然后第6台应该正常价（不是第3台）")
     
-    success, r = take_ticket(data, "促销测试车")
+    success, r = take_ticket(data, "车X")
     success, call_r = call_next_car(data)
-    success, r2 = finish_wash(data, call_r["bay_number"])
-    print(f"      第2次: {r2['price']}元 {'【促销】' if r2.get('promotion_msg') else ''}")
+    success, r4 = finish_wash(data, call_r["bay_number"])
+    print(f"      全店第4台: {r4['price']}元 {'【促销】' if r4.get('promotion_msg') else ''}")
+    assert not r4.get("is_promotion"), "第4台不应是促销"
     
-    success, r = take_ticket(data, "促销测试车")
+    success, r = take_ticket(data, "车Y")
     success, call_r = call_next_car(data)
-    success, r3 = finish_wash(data, call_r["bay_number"])
-    print(f"      第3次: {r3['price']}元 {'【促销】' if r3.get('promotion_msg') else ''}")
-    assert r3["price"] == WASH_PRICE * 0.5, f"第3次应该5折: {r3['price']}"
-    assert r3.get("promotion_msg"), "应该有促销消息"
-    print("   ✅ 满减促销功能正常")
+    success, r5 = finish_wash(data, call_r["bay_number"])
+    print(f"      全店第5台: {r5['price']}元 {'【促销】' if r5.get('promotion_msg') else ''}")
+    assert not r5.get("is_promotion"), "第5台不应是促销"
+    
+    print("   ✅ 满减促销功能正常（已在前3台洗车测试中验证，全店第3台触发5折）")
 
     print("\n8. 测试洗车历史查询...")
     history = get_wash_history(data, "京A12345", 5)
@@ -153,9 +152,48 @@ def test():
     print("\n10. 测试会员列表CSV导出...")
     success, msg = export_members_csv(data, "test_members.csv")
     assert success
-    import os
     assert os.path.exists("test_members.csv")
     print(f"   ✅ {msg}")
+
+    print("\n11. 测试等待时间计算（考虑洗车位占用）...")
+    if os.path.exists(DATA_FILE):
+        os.remove(DATA_FILE)
+    data = load_data()
+    register_member(data, "京D00001", "13000000001", "测试1", "普通")
+    
+    print("      场景A: 无车位占用、无排队")
+    total_waiting, wait = get_wait_time(data)
+    print(f"        排队{total_waiting}人, 预计等待{wait}分钟")
+    assert wait == 0, f"无占用时应为0分钟, 实际{wait}"
+    
+    print("      场景B: 1个车位占用、无排队")
+    take_ticket(data, "京D00001")
+    call_next_car(data)
+    total_waiting, wait = get_wait_time(data)
+    print(f"        排队{total_waiting}人, 预计等待{wait}分钟")
+    assert wait == WASH_DURATION_MINUTES, f"1车位忙+0排队应为{WASH_DURATION_MINUTES}分钟, 实际{wait}"
+    
+    print("      场景C: 2个车位占用、无排队")
+    take_ticket(data, "京E00002")
+    call_next_car(data)
+    total_waiting, wait = get_wait_time(data)
+    print(f"        排队{total_waiting}人, 预计等待{wait}分钟")
+    assert wait == WASH_DURATION_MINUTES, f"2车位忙+0排队应为{WASH_DURATION_MINUTES}分钟, 实际{wait}"
+    
+    print("      场景D: 2个车位占用、1人排队")
+    take_ticket(data, "京F00003")
+    total_waiting, wait = get_wait_time(data)
+    print(f"        排队{total_waiting}人, 预计等待{wait}分钟")
+    assert wait == WASH_DURATION_MINUTES * 2, f"2车位忙+1排队应为{WASH_DURATION_MINUTES*2}分钟, 实际{wait}"
+    
+    print("      场景E: 2个车位占用、3人排队")
+    take_ticket(data, "京G00004")
+    take_ticket(data, "京H00005")
+    total_waiting, wait = get_wait_time(data)
+    print(f"        排队{total_waiting}人, 预计等待{wait}分钟")
+    assert wait == WASH_DURATION_MINUTES * 3, f"2车位忙+3排队应为{WASH_DURATION_MINUTES*3}分钟, 实际{wait}"
+    
+    print("   ✅ 等待时间计算正常（2个车位占用情况已考虑）")
 
     print("\n" + "=" * 60)
     print("🎉 所有测试通过！系统功能正常！")

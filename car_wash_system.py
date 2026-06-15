@@ -92,8 +92,8 @@ def recharge_member(data, plate_number, amount=RECHARGE_AMOUNT):
 
 
 def calculate_promotion_discount(today_stats, plate_number):
-    washes_today = today_stats["plate_washes_today"].get(plate_number, 0)
-    if washes_today + 1 == PROMOTION_WASH_COUNT:
+    store_washes_today = today_stats["total_washes"]
+    if store_washes_today + 1 == PROMOTION_WASH_COUNT:
         return PROMOTION_DISCOUNT, True
     return 1.0, False
 
@@ -150,7 +150,7 @@ def process_wash_payment(data, plate_number):
 
     promotion_msg = ""
     if is_promotion:
-        promotion_msg = f"\n🎉 恭喜！今日第{PROMOTION_WASH_COUNT}次洗车，享受{PROMOTION_DISCOUNT*10:.0f}折优惠！"
+        promotion_msg = f"\n🎉 恭喜！您是本店今日第{PROMOTION_WASH_COUNT}台洗车，享受{PROMOTION_DISCOUNT*10:.0f}折优惠！"
 
     return True, {
         "price": final_price,
@@ -172,8 +172,16 @@ def get_wait_time(data):
     vip_count, normal_count = get_queue_position(data)
     total_waiting = vip_count + normal_count
     active_count = sum(1 for bay in data["active_bays"] if bay is not None)
-    total = total_waiting + max(0, active_count - WASH_BAYS)
-    wait_minutes = (total // WASH_BAYS) * WASH_DURATION_MINUTES
+    busy_bays = active_count
+    if busy_bays == 0:
+        wait_minutes = 0
+    else:
+        cars_ahead = total_waiting + busy_bays
+        full_rounds = cars_ahead // WASH_BAYS
+        remainder = cars_ahead % WASH_BAYS
+        wait_minutes = full_rounds * WASH_DURATION_MINUTES
+        if remainder > 0:
+            wait_minutes += WASH_DURATION_MINUTES
     return total_waiting, wait_minutes
 
 
