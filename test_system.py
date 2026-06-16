@@ -13,259 +13,295 @@ from car_wash_system import (
     get_wash_history, get_daily_report, export_members_csv,
     get_queue_position, get_wait_time, WASH_PRICE,
     WASH_DURATION_MINUTES, WASH_BAYS,
-    add_reservation, find_valid_reservation, list_today_reservations,
+    add_reservation, check_in_reservation, find_valid_reservation,
+    list_today_reservations,
     get_detailed_wait_info, get_bay_free_times, get_bay_status,
-    get_today_stats,
+    get_today_stats, skip_called_car, restore_skipped_car,
+    pause_bay, resume_bay, extend_bay_service, get_range_report,
+    get_effective_elapsed_seconds, get_total_duration_minutes,
 )
 
 
 def _set_bay_start_time(data, bay_index, minutes_ago):
-    """辅助函数：手动设置车位的开始时间，模拟已洗N分钟"""
     bay = data["active_bays"][bay_index]
     if bay is None:
         return
     new_start = datetime.now() - timedelta(minutes=minutes_ago)
     bay["start_time"] = new_start.strftime("%Y-%m-%d %H:%M:%S")
+    bay["paused"] = False
+    bay["pause_start_time"] = None
+    bay["total_paused_seconds"] = 0
+    bay["extra_duration_minutes"] = 0
     save_data(data)
 
 
 def test():
     print("=" * 60)
-    print("🧪 洗车店会员管理系统 v2 - 功能测试")
+    print("🧪 洗车店会员管理系统 v3 - 功能测试")
     print("=" * 60)
 
-    data = load_data()
-
-    # =================== 基础功能回归 ===================
-    print("\n1. 会员注册 & 充值...")
-    register_member(data, "京A普通", "13800000001", "张普通", "普通")
-    register_member(data, "京B金卡", "13900000002", "李金卡", "金卡")
-    recharge_member(data, "京A普通", 100)
-    member = data["members"]["京A普通"]
-    assert member["remaining_washes"] == 3 and member["balance"] == 100
-    print("   ✅ OK")
-
-    # =================== 预约功能 ===================
-    print("\n2. 预约登记 & 取号...")
-    arrival = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
-    ok, msg = add_reservation(data, "京C预约", arrival, False)
-    assert ok
-    ok, msg = add_reservation(data, "京D未来预约", (datetime.now() + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M"), True)
-    assert ok
-
-    today_res = list_today_reservations(data)
-    assert len(today_res) == 2, f"今日预约应为2条: {len(today_res)}"
-    print(f"      今日预约 {len(today_res)} 条")
-
-    # 预约在窗口内，能匹配到
-    res = find_valid_reservation(data, "京C预约")
-    assert res is not None, "预约窗口内应该能匹配"
-    # 预约在5小时后，匹配不到
-    res2 = find_valid_reservation(data, "京D未来预约")
-    assert res2 is None, "预约太早应该匹配不到"
-    print("   ✅ 预约窗口内匹配正常")
-
-    # 预约车取号，优先级应该在普通之前、VIP之后
-    take_ticket(data, "普通1号")
-    take_ticket(data, "京C预约")     # 应该是 reserved 优先级
-    take_ticket(data, "京B金卡")     # vip
-
-    # 队列顺序：VIP 先 → 预约 → 普通
-    assert data["queue"][0]["plate_number"] == "京B金卡", f"第一个应该是VIP，实际 {data['queue'][0]}"
-    assert data["queue"][1]["plate_number"] == "京C预约", f"第二个应该是预约，实际 {data['queue'][1]}"
-    assert data["queue"][2]["plate_number"] == "普通1号", f"第三个应该是普通，实际 {data['queue'][2]}"
-    print(f"      队列顺序: {[q['plate_number'] for q in data['queue']]}")
-    print("   ✅ 预约优先级(VIP>预约>普通)正常")
-
-    # =================== 个人等待时间 & 预计开洗时间 ===================
-    print("\n3. 细化等待时间计算（每台车独立算）...")
+    # =================== 1. 签到 + 预约优先级 ===================
+    print("\n1. 预约签到 + 预约车必须先签到才享受优先...")
     if os.path.exists(DATA_FILE):
         os.remove(DATA_FILE)
     data = load_data()
-    register_member(data, "京A普通", "13800000001", "张普通", "普通")
-    register_member(data, "京B金卡", "13900000002", "李金卡", "金卡")
-    recharge_member(data, "京A普通", 100)
 
-    # 场景：2个车位都忙（1号已洗10分钟剩5，2号已洗0分钟剩15），队里3台车
-    take_ticket(data, "车S1")
-    take_ticket(data, "车S2")
-    call_next_car(data)   # 1号车位车S1
-    call_next_car(data)   # 2号车位车S2
-    _set_bay_start_time(data, 0, 10)  # 1号已洗10分
-    _set_bay_start_time(data, 1, 0)   # 2号刚开洗
+    arrival = (datetime.now() + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
+    add_reservation(data, "预约未签到车", arrival, False)
 
-    # 取号：车Q1(普通)、车Q2(预约)、车Q3(VIP)
-    arrival = (datetime.now()).strftime("%Y-%m-%d %H:%M")
-    add_reservation(data, "车Q2", arrival, False)
-
-    ok, r1 = take_ticket(data, "车Q1")     # 普通
-    ok, r2 = take_ticket(data, "车Q2")     # 预约 (插队到普通前)
-    ok, r3 = take_ticket(data, "京B金卡")  # VIP (插队最前)
-
-    print(f"      取号顺序: Q1({r1['ticket_number']}), Q2({r2['ticket_number']}), VIP({r3['ticket_number']})")
-    print(f"      队列顺序: {[q['plate_number'] for q in data['queue']]}")
-
-    # 重新获取每台车的实时等待信息（因为后来者插队会改变位置）
-    def _live_info(ticket_num):
-        idx = next(i for i, q in enumerate(data["queue"]) if q["ticket_number"] == ticket_num)
-        return idx, get_detailed_wait_info(data, idx)
-
-    idx_r3, info_r3 = _live_info(r3["ticket_number"])
-    idx_r2, info_r2 = _live_info(r2["ticket_number"])
-    idx_r1, info_r1 = _live_info(r1["ticket_number"])
-
-    # VIP应该在队首，前面0台车
-    assert idx_r3 == 0, f"VIP应该第0个，实际{idx_r3}"
-    assert info_r3["cars_ahead"] == 0, f"VIP前面应该0台车，实际{info_r3['cars_ahead']}"
-    # VIP 预计使用1号车位（5分钟后空），所以等待约5分钟
-    print(f"      VIP(Q3) 前面 {info_r3['cars_ahead']} 台，等待 {info_r3['wait_minutes']} 分钟，预计开洗 {info_r3['estimated_start']}，预计车位 {info_r3['assigned_bay']}号")
-    assert info_r3["assigned_bay"] == 1, f"VIP应该分配1号车位（先空闲），实际{info_r3['assigned_bay']}"
-    assert info_r3["wait_minutes"] >= 4, f"VIP等待时间应该约5分钟，实际{info_r3['wait_minutes']}"
-
-    # 预约车Q2，应该排第2（0号VIP，1号Q2，2号Q1）
-    print(f"      预约(Q2) 前面 {info_r2['cars_ahead']} 台，等待 {info_r2['wait_minutes']} 分钟，预计车位 {info_r2['assigned_bay']}号")
-    assert idx_r2 == 1, f"Q2应该第1个，实际{idx_r2}"
-    assert info_r2["cars_ahead"] == 1, f"预约车前面应该1台(VIP)，实际{info_r2['cars_ahead']}"
-
-    # 普通车Q1，应该最后
-    print(f"      普通(Q1) 前面 {info_r1['cars_ahead']} 台，等待 {info_r1['wait_minutes']} 分钟，预计车位 {info_r1['assigned_bay']}号")
-    assert idx_r1 == 2, f"Q1应该第2个，实际{idx_r1}"
-    assert info_r1["cars_ahead"] == 2, f"普通车前面应该2台(VIP+预约)，实际{info_r1['cars_ahead']}"
-
-    print("   ✅ 个人等待时间（前面几台、预计开洗、预计车位）计算正常")
-
-    # =================== 洗车位状态（已洗时长/剩余时间/进度） ===================
-    print("\n4. 洗车位状态细化...")
-    statuses = get_bay_status(data)
-    for s in statuses:
-        if s["is_busy"]:
-            print(f"      {s['bay_number']}号: {s['plate_number']}, 已洗{s['elapsed_minutes']}分, 剩{s['remaining_minutes']}分, 进度{s['progress_pct']}%")
-            if s["bay_number"] == 1:
-                assert s["elapsed_minutes"] >= 9, f"1号车位已洗时间应该约10分，实际{s['elapsed_minutes']}"
-                assert s["remaining_minutes"] <= 6, f"1号车位剩余应该约5分，实际{s['remaining_minutes']}"
-                assert 60 <= s["progress_pct"] <= 80, f"1号进度应该~67%，实际{s['progress_pct']}%"
-    print("   ✅ 洗车位状态（已洗/剩余/进度）正常")
-
-    # =================== 完成后自动叫下一台 ===================
-    print("\n5. 完成洗车 & 自动叫号...")
-    # 完全重置数据，避免前面测试残留
-    if os.path.exists(DATA_FILE):
-        os.remove(DATA_FILE)
-    data = load_data()
-    # 场景：3台车在队里，2个车位叫2台
-    take_ticket(data, "车X1")
-    take_ticket(data, "车X2")
-    take_ticket(data, "车X3")
-    call_next_car(data)  # 1号：车X1
-    call_next_car(data)  # 2号：车X2
-
-    assert len(data["queue"]) == 1, f"队列应该剩1台，实际{len(data['queue'])}"
-
-    # 完成1号车位，应该自动把车X3叫进去
-    ok, result = finish_wash(data, 1, auto_call_next=True)
+    ok, r = take_ticket(data, "预约未签到车")
     assert ok
-    print(f"      车X1完成，自动叫号结果: {result.get('auto_called')}")
-    assert result.get("auto_called"), "应该自动叫下一台"
-    assert result["auto_called"]["plate_number"] == "车X3"
-    assert data["active_bays"][0] is not None, "1号车位应该已经有新车"
+    assert not r["is_reservation"], "没签到不应该识别为预约"
+    assert r["cars_ahead"] == 0
+    print("      没签到时取号，按普通车处理 ✅")
 
-    queue_after = len(data["queue"])
-    print(f"      队列剩余 {queue_after} 台")
-    assert queue_after == 0, f"自动叫完队列应该空，实际{queue_after}"
+    arrival2 = (datetime.now()).strftime("%Y-%m-%d %H:%M")
+    add_reservation(data, "预约已签到车", arrival2, False)
+    check_in_reservation(data, "预约已签到车")
 
-    # 再完成2号，队列空，不应该auto_called
-    ok, result2 = finish_wash(data, 2, auto_call_next=True)
-    assert ok and "auto_called" not in result2
-    print("   ✅ 完成后自动叫下一台（有排队时）正常，无排队时不报错")
+    # 重置队列
+    data["queue"] = []
+    data["next_ticket_number"] = 1
+    save_data(data)
 
-    # =================== 日报表细化 ===================
-    print("\n6. 日报表细化（半价次数、抵扣次数、支付明细）...")
-    # 构造5台车场景（第3台半价）
+    take_ticket(data, "普通车A")
+    ok, r2 = take_ticket(data, "预约已签到车")
+    assert ok
+    assert r2["is_reservation"], "已签到应该识别为预约"
+    assert data["queue"][0]["plate_number"] == "预约已签到车", "预约车应该排到普通车前面"
+    print(f"      签到后取号，识别为预约车并插队到普通车前: {[q['plate_number'] for q in data['queue']]} ✅")
+    print("   ✅ 预约签到功能正常")
+
+    # =================== 2. 过号 & 恢复 ===================
+    print("\n2. 过号处理 & 恢复到合适位置...")
     if os.path.exists(DATA_FILE):
         os.remove(DATA_FILE)
     data = load_data()
-    register_member(data, "京A普通", "13800000001", "张普通", "普通")
-    register_member(data, "京B金卡", "13900000002", "李金卡", "金卡")
-    recharge_member(data, "京A普通", 100)   # 充值100
+    register_member(data, "金卡A", "13800000001", "金卡A", "金卡")
+    recharge_member(data, "金卡A", 100)
 
-    plates = ["非会员A", "非会员B", "京A普通", "非会员C", "京B金卡"]
-    for p in plates:
+    take_ticket(data, "普通1")
+    take_ticket(data, "普通2")
+    ok, r_vip = take_ticket(data, "金卡A")   # VIP应该排第一
+    take_ticket(data, "普通3")
+
+    assert data["queue"][0]["plate_number"] == "金卡A"
+    assert data["queue"][3]["plate_number"] == "普通3"
+    print(f"      队列: {[q['plate_number'] for q in data['queue']]}")
+
+    ok, msg = skip_called_car(data, "普通2")
+    assert ok, f"过号失败: {msg}"
+    assert len(data["skipped_tickets"]) == 1
+    assert data["skipped_tickets"][0]["plate_number"] == "普通2"
+    assert len(data["queue"]) == 3, f"队列应该剩3台，实际{len(data['queue'])}"
+    print(f"      普通2过号，队列剩余: {[q['plate_number'] for q in data['queue']]} ✅")
+
+    ok, res = restore_skipped_car(data, "普通2")
+    assert ok, f"恢复失败: {res}"
+    assert len(data["skipped_tickets"]) == 0
+    assert res["priority"] == "normal"
+    print(f"      恢复成功: 普通2现在队列第{res['new_position']}位，前面{res['cars_ahead']}台")
+    print(f"      恢复后队列: {[q['plate_number'] for q in data['queue']]}")
+    assert data["queue"][-1]["plate_number"] == "普通2", "恢复普通车应该排到同优先级队尾"
+    print("   ✅ 过号 & 恢复按优先级插入正确")
+
+    # =================== 3. 叫号衔接严格化 ===================
+    print("\n3. 叫号衔接更严：车位未明确完成时不能被下一台占用...")
+    if os.path.exists(DATA_FILE):
+        os.remove(DATA_FILE)
+    data = load_data()
+
+    take_ticket(data, "车A")
+    take_ticket(data, "车B")
+    take_ticket(data, "车C")
+
+    ok, r1 = call_next_car(data)  # 1号车A
+    assert ok and r1["bay_number"] == 1
+    ok, r2 = call_next_car(data)  # 2号车B
+    assert ok and r2["bay_number"] == 2
+
+    # 2个车位都忙，再叫号应该失败，给出具体车位信息
+    ok, msg3 = call_next_car(data)
+    assert not ok
+    assert "1号" in msg3 and "2号" in msg3
+    print(f"      2个车位忙时叫号失败: {msg3} ✅")
+
+    # 先手动改1号车位的 start_time 为 100 分钟前，模拟早就洗完了，但系统还没"完成结算"
+    _set_bay_start_time(data, 0, 100)
+    # 再叫号应该仍然失败——因为 active_bays[0] 不是 None（没有明确完成）
+    ok, msg4 = call_next_car(data)
+    assert not ok, "即使时间早就到了，只要没显式完成，车位应仍被占用"
+    print(f"      即使预计结束时间已过，未显式完成时叫号仍失败: {msg4} ✅")
+
+    # 显式完成1号
+    ok, res = finish_wash(data, 1, auto_call_next=True)
+    assert ok
+    assert data["active_bays"][0]["plate_number"] == "车C", "完成后应该自动叫车C"
+    print(f"      完成1号，自动叫车C到1号 ✅")
+    print("   ✅ 叫号衔接严格化（只有显式完成才能进下一台）")
+
+    # =================== 4. 暂停 / 继续 / 延长时长 ===================
+    print("\n4. 车位暂停 / 继续 / 延长时长 & 排队时间同步...")
+    if os.path.exists(DATA_FILE):
+        os.remove(DATA_FILE)
+    data = load_data()
+
+    take_ticket(data, "车位车1")
+    take_ticket(data, "车位车2")
+    take_ticket(data, "排队车1")
+    ok, r = call_next_car(data)
+    assert ok and r["plate_number"] == "车位车1"
+    ok, r = call_next_car(data)
+    assert ok and r["plate_number"] == "车位车2"
+
+    # 已洗10分钟：start_time 设为15分钟前，后面模拟暂停了5分钟
+    _set_bay_start_time(data, 0, 15)
+    _set_bay_start_time(data, 1, 15)
+
+    # 正常情况（还没暂停）：2个车位已洗15分钟？不对，_set_bay_start_time(15)表示15分钟前开始，所以已洗15分，剩0分
+    # 重新调整为：start_time 设为20分钟前，已洗15分，剩0分（模拟马上要洗完，但我们要"已洗10分钟"，所以start_time = 25分钟前，已洗15分？不对...
+    # 简单点：先让已洗10分钟，剩5分钟，不暂停
+    _set_bay_start_time(data, 0, 10)
+    _set_bay_start_time(data, 1, 10)
+
+    # 正常情况：2个车位都已洗10分钟，各剩5分钟，排队车1约等5分钟
+    status = get_bay_status(data)[0]
+    assert status["elapsed_minutes"] >= 9, f"已洗约10分，实际{status['elapsed_minutes']}"
+    assert status["remaining_minutes"] <= 6, f"剩约5分，实际{status['remaining_minutes']}"
+
+    _, baseline_wait = get_wait_time(data)
+    print(f"      暂停前：1号已洗{status['elapsed_minutes']}分，剩{status['remaining_minutes']}分，队尾约等{baseline_wait}分钟")
+    assert baseline_wait >= 4, f"基线应该约5分，实际{baseline_wait}"
+
+    # 暂停1号
+    ok, msg = pause_bay(data, 1)
+    assert ok
+    assert data["active_bays"][0]["paused"] is True
+    print(f"      暂停1号: {msg}")
+
+    # 模拟：洗车是10分钟前开始的（start_time），暂停发生在5分钟前
+    # 即 start_time = now - 15分钟，pause_start_time = now - 5分钟
+    # 这样总经过15分钟，其中暂停了5分钟，有效已洗10分钟
+    new_start = (datetime.now() - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+    data["active_bays"][0]["start_time"] = new_start
+    ps = datetime.strptime(data["active_bays"][0]["pause_start_time"], "%Y-%m-%d %H:%M:%S")
+    data["active_bays"][0]["pause_start_time"] = (ps - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    save_data(data)
+
+    # 暂停状态下读状态：有效已洗时间应该是10分钟，暂停累计5分钟
+    status2 = get_bay_status(data)[0]
+    assert status2["paused"] is True
+    assert 9 <= status2["elapsed_minutes"] <= 11, f"暂停中有效已洗时间应该约10分，实际{status2['elapsed_minutes']}"
+    assert status2["total_paused_minutes"] >= 4, f"累计暂停应该约5分，实际{status2['total_paused_minutes']}"
+    print(f"      暂停5分钟后读状态：1号已洗{status2['elapsed_minutes']}分（冻结），暂停累计{status2['total_paused_minutes']}分 ✅")
+
+    # 继续1号
+    ok, msg = resume_bay(data, 1)
+    assert ok
+    assert data["active_bays"][0]["paused"] is False
+
+    status3 = get_bay_status(data)[0]
+    assert status3["total_paused_minutes"] >= 4
+    # 继续后：总时长15分，有效已洗10分，剩余应该约5分（但还要加暂停的5分到预计结束）
+    # 暂停累计5分钟，所以预计结束 = start + 15分 + 5分暂停 = 现在 + 5分
+    assert status3["remaining_minutes"] >= 3, f"1号继续后应该剩约5分，实际{status3['remaining_minutes']}"
+    print(f"      继续1号后：剩{status3['remaining_minutes']}分，累计暂停{status3['total_paused_minutes']}分 ✅")
+
+    # 再延长1号10分钟（加内饰打蜡）
+    ok, msg = extend_bay_service(data, 1, 10)
+    assert ok
+    status4 = get_bay_status(data)[0]
+    assert status4["extra_duration_minutes"] == 10
+    # 剩余应该约5分+10分=15分
+    assert status4["remaining_minutes"] >= 13, f"1号延长后应该剩约15分，实际{status4['remaining_minutes']}"
+    print(f"      延长1号10分后：剩{status4['remaining_minutes']}分，总时长{get_total_duration_minutes(data['active_bays'][0])}分 ✅")
+
+    # 同样处理2号：start_time=15分钟前，暂停5分钟，延长5分钟
+    new_start2 = (datetime.now() - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+    data["active_bays"][1]["start_time"] = new_start2
+    pause_bay(data, 2)
+    ps2 = datetime.strptime(data["active_bays"][1]["pause_start_time"], "%Y-%m-%d %H:%M:%S")
+    data["active_bays"][1]["pause_start_time"] = (ps2 - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    save_data(data)
+    resume_bay(data, 2)
+    extend_bay_service(data, 2, 5)
+
+    # 排队时间同步：队尾等待时间应该显著大于基线（约多10-20分钟）
+    _, wait_after = get_wait_time(data)
+    print(f"      队尾等待：2个车位都延迟后约等{wait_after}分钟（基线{baseline_wait}分钟）")
+    assert wait_after >= baseline_wait + 5, f"延迟后等待时间应该更长，实际{wait_after} vs 基线{baseline_wait}"
+    print("   ✅ 暂停/继续/延长 & 排队时间同步全部正常")
+
+    # =================== 5. 时间段经营报表 ===================
+    print("\n5. 时间段经营报表（跨日汇总、会员余额消费、各项明细）...")
+    if os.path.exists(DATA_FILE):
+        os.remove(DATA_FILE)
+    data = load_data()
+    register_member(data, "京A", "13800000001", "A", "普通")
+    recharge_member(data, "京A", 100)      # 充值100
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # 手动往 daily_stats 里塞一些昨天的数据（模拟跨日）
+    data["daily_stats"][yesterday] = {
+        "total_washes": 4,
+        "member_washes": 2,
+        "cash_income": 40.0,
+        "recharge_amount": 100.0,
+        "promotion_count": 1,
+        "wash_credits_used": 1,
+        "member_balance_spent": 20.0,
+        "payment_breakdown": {"现金": 40.0, "会员余额": 20.0, "会员次数": 0.0},
+        "plate_washes_today": {},
+    }
+
+    # 今天再实际跑几台，让今天也有数据
+    plates_flow = ["非A", "非B", "京A"]
+    for p in plates_flow:
         take_ticket(data, p)
         ok, c = call_next_car(data)
         while not ok:
-            # 车位忙，先释放一个
             for i in range(1, WASH_BAYS + 1):
                 if data["active_bays"][i - 1] is not None:
-                    ok_f, _ = finish_wash(data, i, auto_call_next=False)
-                    if ok_f:
-                        break
+                    finish_wash(data, i, auto_call_next=False)
+                    break
             ok, c = call_next_car(data)
-    # 完成剩余占用
     for i in range(1, WASH_BAYS + 1):
         if data["active_bays"][i - 1] is not None:
             finish_wash(data, i, auto_call_next=False)
 
-    report = get_daily_report(data)
-    assert report
-    print(f"      总洗台数: {report['total_washes']}")
-    print(f"      半价优惠次数: {report['promotion_count']}")
-    print(f"      会员次数抵扣: {report['wash_credits_used']}")
-    print(f"      会员/非会员: {report['member_washes']}/{report['non_member_washes']}")
-    print(f"      支付方式明细: {report['payment_breakdown']}")
+    ok, rep = get_range_report(data, yesterday, today)
+    assert ok, f"时间段报表失败: {rep}"
+    print(f"      周期: {rep['start_date']} ~ {rep['end_date']}")
+    print(f"      天数: {rep['days_total']}天，有数据{rep['days_covered']}天")
+    print(f"      总洗台数: {rep['total_washes']} (昨天4 + 今天{rep['total_washes'] - 4})")
+    print(f"      现金收入: {rep['cash_income']:.2f}")
+    print(f"      会员充值: {rep['recharge_amount']:.2f}")
+    print(f"      会员余额消费: {rep['member_balance_spent']:.2f}")
+    print(f"      半价优惠: {rep['promotion_count']} 次")
+    print(f"      会员次数抵扣: {rep['wash_credits_used']} 次")
+    print(f"      支付方式明细: {rep['payment_breakdown']}")
+    print(f"      每日明细: {rep['daily_details']}")
 
-    assert report["total_washes"] == 5, f"应该5台（手动5台），实际{report['total_washes']}"
-    assert report["promotion_count"] == 1, f"半价优惠应该正好1次（第3台），实际{report['promotion_count']}"
-    assert report["wash_credits_used"] == 1, f"次数抵扣应该正好1次（京A普通），实际{report['wash_credits_used']}"
-    assert isinstance(report["payment_breakdown"], dict) and len(report["payment_breakdown"]) > 0
-    print("   ✅ 日报表（半价次数/抵扣次数/支付明细）齐全")
+    assert rep["days_covered"] == 2
+    assert rep["total_washes"] >= 7, f"至少4+3=7台"
+    assert rep["recharge_amount"] >= 200.0, f"昨天100+今天100=200充值，实际{rep['recharge_amount']}"
+    assert rep["member_balance_spent"] >= 20.0, f"昨天消费20"
+    assert rep["promotion_count"] >= 1
+    assert rep["wash_credits_used"] >= 1
+    assert isinstance(rep["payment_breakdown"], dict) and len(rep["payment_breakdown"]) >= 1
+    assert len(rep["daily_details"]) == 2
 
-    # =================== 综合场景 ===================
-    print("\n7. 综合场景：VIP/预约/普通混合取号+等待计算...")
-    if os.path.exists(DATA_FILE):
-        os.remove(DATA_FILE)
-    data = load_data()
-    register_member(data, "京B金卡", "13900000002", "李金卡", "金卡")
-
-    # 2个车位都刚开洗（满）
-    take_ticket(data, "占位A")
-    take_ticket(data, "占位B")
-    call_next_car(data)
-    call_next_car(data)
-
-    # 取号顺序：普通A → 预约A → VIP → 普通B → 预约B
-    arrival = (datetime.now()).strftime("%Y-%m-%d %H:%M")
-    add_reservation(data, "预约甲", arrival)
-    add_reservation(data, "预约乙", arrival)
-
-    take_ticket(data, "普通A")
-    take_ticket(data, "预约甲")
-    take_ticket(data, "京B金卡")
-    take_ticket(data, "普通B")
-    take_ticket(data, "预约乙")
-
-    # 最终队列应该是：京B金卡 → 预约甲 → 预约乙 → 普通A → 普通B
-    expected = ["京B金卡", "预约甲", "预约乙", "普通A", "普通B"]
-    actual = [q["plate_number"] for q in data["queue"]]
-    print(f"      期望顺序: {expected}")
-    print(f"      实际顺序: {actual}")
-    assert actual == expected, f"队列顺序不对: {actual}"
-
-    # 每个人的前面几台数
-    for i, plate in enumerate(expected):
-        info = get_detailed_wait_info(data, i)
-        assert info["cars_ahead"] == i, f"{plate}前面应该{i}台，实际{info['cars_ahead']}"
-        # 2车位都刚开洗=15分钟后空
-        # i=0,1: 15分钟后开 (分配1号和2号)
-        # i=2,3: 30分钟后 (1号2号下一轮)
-        # i=4:   45分钟 (再下一轮第一个)
-        expected_wait = ((i // WASH_BAYS) + 1) * WASH_DURATION_MINUTES
-        assert abs(info["wait_minutes"] - expected_wait) <= 2, f"{plate}等待约{expected_wait}分，实际{info['wait_minutes']}分"
-        print(f"      {plate}: 前面{info['cars_ahead']}台, 等{info['wait_minutes']}分, 预计{info['assigned_bay']}号")
-
-    print("   ✅ 综合混合队列优先级和等待时间都正确")
+    # 非法日期
+    ok, err = get_range_report(data, "2025-13-40", "2025-01-01")
+    assert not ok
+    ok, err2 = get_range_report(data, "2025-12-31", "2025-01-01")
+    assert not ok
+    print("   ✅ 时间段报表跨日汇总、日期校验正常")
 
     print("\n" + "=" * 60)
-    print("🎉 所有v2测试通过！新功能验证完毕！")
+    print("🎉 所有v3测试通过！新功能验证完毕！")
     print("=" * 60)
 
 

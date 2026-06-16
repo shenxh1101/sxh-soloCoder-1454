@@ -17,13 +17,7 @@ RESERVATION_WINDOW_MINUTES = 30
 
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if "reservations" not in data:
-                data["reservations"] = []
-            return data
-    return {
+    defaults = {
         "members": {},
         "wash_history": [],
         "queue": [],
@@ -31,7 +25,22 @@ def load_data():
         "next_ticket_number": 1,
         "active_bays": [None] * WASH_BAYS,
         "reservations": [],
+        "skipped_tickets": [],
     }
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k, v in defaults.items():
+            if k not in data:
+                data[k] = v
+        for bay in data["active_bays"]:
+            if isinstance(bay, dict):
+                bay.setdefault("paused", False)
+                bay.setdefault("pause_start_time", None)
+                bay.setdefault("total_paused_seconds", 0)
+                bay.setdefault("extra_duration_minutes", 0)
+        return data
+    return defaults.copy()
 
 
 def save_data(data):
@@ -59,14 +68,15 @@ def get_today_stats(data):
             "promotion_count": 0,
             "wash_credits_used": 0,
             "payment_breakdown": {},
+            "member_balance_spent": 0.0,
         }
     stats = data["daily_stats"][today]
-    for key in ("promotion_count", "wash_credits_used", "payment_breakdown"):
+    for key in ("promotion_count", "wash_credits_used", "payment_breakdown", "member_balance_spent"):
         if key not in stats:
             if key == "payment_breakdown":
                 stats[key] = {}
             else:
-                stats[key] = 0
+                stats[key] = 0.0 if key.endswith("_spent") else 0
     return stats
 
 
@@ -127,18 +137,32 @@ def add_reservation(data, plate_number, arrival_time_str, is_member_known=False)
     return True, f"预约成功！车牌 {plate_number}，预约时间 {arrival_time.strftime('%m月%d日 %H:%M')}"
 
 
-def find_valid_reservation(data, plate_number):
+def find_valid_reservation(data, plate_number, require_checked_in=True):
     current_time = now()
     for res in data["reservations"]:
         if res["plate_number"] != plate_number:
             continue
-        if res["status"] != "pending":
+        if res["status"] not in ("pending", "checked_in"):
             continue
         arrival = datetime.strptime(res["arrival_time"], "%Y-%m-%d %H:%M:%S")
         delta = (arrival - current_time).total_seconds() / 60
         if -RESERVATION_WINDOW_MINUTES <= delta <= RESERVATION_WINDOW_MINUTES:
+            if require_checked_in and res["status"] != "checked_in":
+                continue
             return res
     return None
+
+
+def check_in_reservation(data, plate_number):
+    res = find_valid_reservation(data, plate_number, require_checked_in=False)
+    if res is None:
+        return False, "未找到可签到的预约（超出签到时间窗口或状态异常）"
+    if res["status"] == "checked_in":
+        return False, "该预约已签到"
+    res["status"] = "checked_in"
+    res["check_in_time"] = now().strftime("%Y-%m-%d %H:%M:%S")
+    save_data(data)
+    return True, f"签到成功！车牌 {plate_number}，可前往取号享受预约优先"
 
 
 def mark_reservation_used(data, reservation):
@@ -172,6 +196,7 @@ def process_wash_payment(data, plate_number):
 
     payment_method = "现金"
     used_washes = 0
+    balance_spent = 0.0
 
     if member:
         if member["remaining_washes"] > 0:
@@ -184,6 +209,7 @@ def process_wash_payment(data, plate_number):
             member["balance"] -= final_price
             member["total_washes"] += 1
             payment_method = "会员余额"
+            balance_spent = final_price
         else:
             if final_price > 0:
                 today_stats["cash_income"] += final_price
@@ -202,6 +228,8 @@ def process_wash_payment(data, plate_number):
         today_stats["promotion_count"] = today_stats.get("promotion_count", 0) + 1
     if used_washes:
         today_stats["wash_credits_used"] = today_stats.get("wash_credits_used", 0) + 1
+    if balance_spent > 0:
+        today_stats["member_balance_spent"] = today_stats.get("member_balance_spent", 0.0) + balance_spent
     breakdown = today_stats.setdefault("payment_breakdown", {})
     breakdown[payment_method] = breakdown.get(payment_method, 0.0) + final_price
 
@@ -213,6 +241,7 @@ def process_wash_payment(data, plate_number):
         "is_member": member is not None,
         "is_promotion": is_promotion,
         "used_washes": used_washes,
+        "balance_spent": balance_spent,
     }
     data["wash_history"].append(record)
     save_data(data)
@@ -232,6 +261,7 @@ def process_wash_payment(data, plate_number):
         "promotion_msg": promotion_msg,
         "remaining_washes": member["remaining_washes"] if member else 0,
         "balance": member["balance"] if member else 0,
+        "balance_spent": balance_spent,
     }
 
 
@@ -240,6 +270,22 @@ def get_queue_position(data):
     vip_queue = [item for item in data["queue"] if item["priority"] == "vip"]
     reserved_queue = [item for item in data["queue"] if item["priority"] == "reserved"]
     return len(vip_queue), len(reserved_queue), len(normal_queue)
+
+
+def get_effective_elapsed_seconds(bay, current_time):
+    start = datetime.strptime(bay["start_time"], "%Y-%m-%d %H:%M:%S")
+    total_paused = bay.get("total_paused_seconds", 0)
+    if bay.get("paused") and bay.get("pause_start_time"):
+        pause_start = datetime.strptime(bay["pause_start_time"], "%Y-%m-%d %H:%M:%S")
+        total_paused += (current_time - pause_start).total_seconds()
+    elapsed = (current_time - start).total_seconds() - total_paused
+    return max(0.0, elapsed), total_paused
+
+
+def get_total_duration_minutes(bay):
+    base = WASH_DURATION_MINUTES
+    extra = bay.get("extra_duration_minutes", 0)
+    return base + extra
 
 
 def get_bay_free_times(data, current_time=None):
@@ -252,7 +298,15 @@ def get_bay_free_times(data, current_time=None):
             free_times.append((i, current_time))
         else:
             start = datetime.strptime(bay["start_time"], "%Y-%m-%d %H:%M:%S")
-            free_at = start + timedelta(minutes=WASH_DURATION_MINUTES)
+            total_dur = get_total_duration_minutes(bay)
+            extra_paused = 0
+            if bay.get("paused") and bay.get("pause_start_time"):
+                pause_start = datetime.strptime(bay["pause_start_time"], "%Y-%m-%d %H:%M:%S")
+                extra_paused = (current_time - pause_start).total_seconds()
+            total_paused_sec = bay.get("total_paused_seconds", 0) + extra_paused
+            free_at = start + timedelta(minutes=total_dur) + timedelta(seconds=total_paused_sec)
+            if bay.get("paused"):
+                free_at = free_at
             free_times.append((i, free_at))
     free_times.sort(key=lambda x: x[1])
     return free_times
@@ -341,13 +395,11 @@ def take_ticket(data, plate_number):
 
     reservation = None
     priority = "normal"
-    reservation_info = None
 
     if not is_vip:
-        reservation = find_valid_reservation(data, plate_number)
+        reservation = find_valid_reservation(data, plate_number, require_checked_in=True)
         if reservation:
             priority = "reserved"
-            reservation_info = reservation
 
     if is_vip:
         priority = "vip"
@@ -359,6 +411,8 @@ def take_ticket(data, plate_number):
         "priority": priority,
         "take_time": now().strftime("%Y-%m-%d %H:%M:%S"),
         "is_reservation": reservation is not None,
+        "is_skipped": False,
+        "original_priority": priority,
     }
     data["next_ticket_number"] += 1
 
@@ -379,7 +433,7 @@ def take_ticket(data, plate_number):
 
     position_msg = ""
     if is_vip:
-        vip_pos = actual_index + 1 if ticket["priority"] == "vip" else sum(1 for q in data["queue"][:actual_index] if q["priority"] == "vip") + 1
+        vip_pos = sum(1 for q in data["queue"][:actual_index] if q["priority"] == "vip") + 1
         position_msg = f"您是金卡会员，已优先排到第{vip_pos}位（VIP队列）"
     elif reservation:
         reserved_before = sum(1 for q in data["queue"][:actual_index] if q["priority"] == "reserved")
@@ -401,24 +455,153 @@ def take_ticket(data, plate_number):
     return True, result
 
 
+def skip_called_car(data, ticket_number_or_plate):
+    for i, q in enumerate(data["queue"]):
+        match = False
+        try:
+            tn = int(ticket_number_or_plate)
+            if q["ticket_number"] == tn:
+                match = True
+        except (ValueError, TypeError):
+            pass
+        if q["plate_number"] == ticket_number_or_plate:
+            match = True
+        if match:
+            skipped = data["queue"].pop(i)
+            skipped["is_skipped"] = True
+            skipped["skip_time"] = now().strftime("%Y-%m-%d %H:%M:%S")
+            skipped["skip_count"] = skipped.get("skip_count", 0) + 1
+            data["skipped_tickets"].append(skipped)
+            save_data(data)
+            return True, f"票号{skipped['ticket_number']:03d}({skipped['plate_number']}) 已过号，稍后可凭票号恢复"
+    return False, "队列为空或未找到对应车辆"
+
+
+def restore_skipped_car(data, ticket_number_or_plate):
+    found_idx = None
+    for i, t in enumerate(data["skipped_tickets"]):
+        match = False
+        try:
+            tn = int(ticket_number_or_plate)
+            if t["ticket_number"] == tn:
+                match = True
+        except (ValueError, TypeError):
+            pass
+        if t["plate_number"] == ticket_number_or_plate:
+            match = True
+        if match:
+            found_idx = i
+            break
+    if found_idx is None:
+        return False, "未找到过号记录"
+
+    ticket = data["skipped_tickets"].pop(found_idx)
+    ticket["is_skipped"] = False
+    ticket["restore_time"] = now().strftime("%Y-%m-%d %H:%M:%S")
+    priority = ticket.get("original_priority", ticket.get("priority", "normal"))
+    ticket["priority"] = priority
+
+    priority_order = {"vip": 0, "reserved": 1, "normal": 2}
+    ticket_rank = priority_order.get(priority, 2)
+    same_rank_list = [i for i, q in enumerate(data["queue"]) if priority_order.get(q["priority"], 2) == ticket_rank]
+    if same_rank_list:
+        insert_pos = same_rank_list[-1] + 1
+    else:
+        insert_pos = len(data["queue"])
+        for i, existing in enumerate(data["queue"]):
+            existing_rank = priority_order.get(existing["priority"], 2)
+            if ticket_rank < existing_rank:
+                insert_pos = i
+                break
+
+    data["queue"].insert(insert_pos, ticket)
+    save_data(data)
+
+    actual_index = next(
+        (i for i, q in enumerate(data["queue"]) if q["ticket_number"] == ticket["ticket_number"]),
+        insert_pos,
+    )
+    wait_info = get_detailed_wait_info(data, actual_index)
+
+    return True, {
+        "ticket_number": ticket["ticket_number"],
+        "plate_number": ticket["plate_number"],
+        "new_position": actual_index + 1,
+        "priority": priority,
+        "wait_minutes": wait_info["wait_minutes"] if wait_info else 0,
+        "cars_ahead": wait_info["cars_ahead"] if wait_info else 0,
+    }
+
+
+def pause_bay(data, bay_number):
+    bay_index = bay_number - 1
+    bay = data["active_bays"][bay_index]
+    if bay is None:
+        return False, "该车位当前空闲，无法暂停"
+    if bay.get("paused"):
+        return False, "该车位已处于暂停状态"
+    bay["paused"] = True
+    bay["pause_start_time"] = now().strftime("%Y-%m-%d %H:%M:%S")
+    save_data(data)
+    return True, f"{bay_number}号车位已暂停，计时已冻结"
+
+
+def resume_bay(data, bay_number):
+    bay_index = bay_number - 1
+    bay = data["active_bays"][bay_index]
+    if bay is None:
+        return False, "该车位当前空闲"
+    if not bay.get("paused"):
+        return False, "该车位未暂停"
+    pause_start = datetime.strptime(bay["pause_start_time"], "%Y-%m-%d %H:%M:%S")
+    paused_seconds = (now() - pause_start).total_seconds()
+    bay["total_paused_seconds"] = bay.get("total_paused_seconds", 0) + paused_seconds
+    bay["paused"] = False
+    bay["pause_start_time"] = None
+    save_data(data)
+    paused_min = int(round(paused_seconds / 60))
+    return True, f"{bay_number}号车位已恢复，本次暂停 {paused_min} 分钟"
+
+
+def extend_bay_service(data, bay_number, extra_minutes):
+    bay_index = bay_number - 1
+    bay = data["active_bays"][bay_index]
+    if bay is None:
+        return False, "该车位当前空闲"
+    if extra_minutes <= 0:
+        return False, "延长时长必须为正数"
+    bay["extra_duration_minutes"] = bay.get("extra_duration_minutes", 0) + extra_minutes
+    save_data(data)
+    total_extra = bay["extra_duration_minutes"]
+    return True, f"{bay_number}号车位已延长服务 {extra_minutes} 分钟，累计延长 {total_extra} 分钟"
+
+
 def call_next_car(data):
     if not data["queue"]:
         return False, "队列为空，没有等待的车辆"
 
     available_bay = None
-    current_time = now()
-    bay_free = get_bay_free_times(data, current_time)
-    for bay_idx, free_at in bay_free:
-        if free_at <= current_time + timedelta(seconds=1):
-            available_bay = bay_idx
+    for i in range(WASH_BAYS):
+        if data["active_bays"][i] is None:
+            available_bay = i
             break
 
     if available_bay is None:
-        return False, "所有洗车位都在使用中"
+        busy_list = []
+        for i in range(WASH_BAYS):
+            bay = data["active_bays"][i]
+            if bay:
+                tag = "暂停中" if bay.get("paused") else "洗车中"
+                busy_list.append(f"{i+1}号({bay['plate_number']} {tag})")
+        return False, f"所有洗车位都在使用中: {', '.join(busy_list)}"
 
     next_car = data["queue"].pop(0)
     next_car["start_time"] = now().strftime("%Y-%m-%d %H:%M:%S")
     next_car["bay_number"] = available_bay + 1
+    next_car["paused"] = False
+    next_car["pause_start_time"] = None
+    next_car["total_paused_seconds"] = 0
+    next_car["extra_duration_minutes"] = 0
     data["active_bays"][available_bay] = next_car
 
     save_data(data)
@@ -438,12 +621,19 @@ def get_bay_status(data):
         bay = data["active_bays"][i]
         info = {"bay_number": i + 1, "is_busy": False}
         if bay:
+            elapsed_sec, _ = get_effective_elapsed_seconds(bay, current_time)
+            total_dur = get_total_duration_minutes(bay)
+            elapsed_minutes = int(elapsed_sec // 60)
+            remaining_seconds = total_dur * 60 - elapsed_sec
+            remaining_minutes = max(0, int(round(remaining_seconds / 60)))
+            progress_pct = min(100, int(elapsed_sec / (total_dur * 60) * 100)) if total_dur > 0 else 100
             start = datetime.strptime(bay["start_time"], "%Y-%m-%d %H:%M:%S")
-            elapsed_seconds = (current_time - start).total_seconds()
-            elapsed_minutes = int(elapsed_seconds // 60)
-            remaining_minutes = max(0, WASH_DURATION_MINUTES - elapsed_minutes)
-            progress_pct = min(100, int(elapsed_seconds / (WASH_DURATION_MINUTES * 60) * 100))
-            estimated_end = start + timedelta(minutes=WASH_DURATION_MINUTES)
+            extra_paused_sec = 0
+            if bay.get("paused") and bay.get("pause_start_time"):
+                ps = datetime.strptime(bay["pause_start_time"], "%Y-%m-%d %H:%M:%S")
+                extra_paused_sec = (current_time - ps).total_seconds()
+            total_paused_min = int(round((bay.get("total_paused_seconds", 0) + extra_paused_sec) / 60))
+            estimated_end = start + timedelta(minutes=total_dur) + timedelta(seconds=bay.get("total_paused_seconds", 0) + extra_paused_sec)
             info.update({
                 "is_busy": True,
                 "plate_number": bay["plate_number"],
@@ -455,6 +645,9 @@ def get_bay_status(data):
                 "remaining_minutes": remaining_minutes,
                 "progress_pct": progress_pct,
                 "estimated_end": estimated_end,
+                "paused": bay.get("paused", False),
+                "total_paused_minutes": total_paused_min,
+                "extra_duration_minutes": bay.get("extra_duration_minutes", 0),
             })
         result.append(info)
     return result
@@ -471,6 +664,7 @@ def finish_wash(data, bay_number, auto_call_next=True):
     car = data["active_bays"][bay_index]
     plate_number = car["plate_number"]
     data["active_bays"][bay_index] = None
+    save_data(data)
 
     success, result = process_wash_payment(data, plate_number)
     if not success:
@@ -517,9 +711,65 @@ def get_daily_report(data, date_str=None):
         "total_income": stats["cash_income"] + stats["recharge_amount"],
         "promotion_count": stats.get("promotion_count", 0),
         "wash_credits_used": stats.get("wash_credits_used", 0),
+        "member_balance_spent": stats.get("member_balance_spent", 0.0),
         "payment_breakdown": payment_breakdown,
         "non_member_washes": stats["total_washes"] - stats["member_washes"],
+        "days_covered": 1,
     }
+
+
+def get_range_report(data, start_date_str, end_date_str):
+    try:
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+    except ValueError:
+        return False, "日期格式错误，请使用 YYYY-MM-DD"
+    if start_dt > end_dt:
+        return False, "开始日期不能晚于结束日期"
+
+    merged = {
+        "start_date": start_date_str,
+        "end_date": end_date_str,
+        "total_washes": 0,
+        "member_washes": 0,
+        "non_member_washes": 0,
+        "cash_income": 0.0,
+        "recharge_amount": 0.0,
+        "member_balance_spent": 0.0,
+        "total_income": 0.0,
+        "promotion_count": 0,
+        "wash_credits_used": 0,
+        "payment_breakdown": {},
+        "days_covered": 0,
+        "daily_details": [],
+    }
+
+    days = (end_dt - start_dt).days + 1
+    for d in range(days):
+        date = (start_dt + timedelta(days=d)).strftime("%Y-%m-%d")
+        report = get_daily_report(data, date)
+        if report:
+            merged["days_covered"] += 1
+            merged["total_washes"] += report["total_washes"]
+            merged["member_washes"] += report["member_washes"]
+            merged["non_member_washes"] += report["non_member_washes"]
+            merged["cash_income"] += report["cash_income"]
+            merged["recharge_amount"] += report["recharge_amount"]
+            merged["member_balance_spent"] += report["member_balance_spent"]
+            merged["promotion_count"] += report["promotion_count"]
+            merged["wash_credits_used"] += report["wash_credits_used"]
+            for method, amount in report["payment_breakdown"].items():
+                merged["payment_breakdown"][method] = merged["payment_breakdown"].get(method, 0.0) + amount
+            merged["daily_details"].append({
+                "date": date,
+                "total_washes": report["total_washes"],
+                "cash_income": report["cash_income"],
+                "recharge_amount": report["recharge_amount"],
+            })
+
+    merged["total_income"] = merged["cash_income"] + merged["recharge_amount"]
+    merged["days_total"] = days
+    return True, merged
 
 
 def export_members_csv(data, filename="members.csv"):
@@ -542,23 +792,27 @@ def export_members_csv(data, filename="members.csv"):
 
 
 def display_menu():
-    print("\n" + "=" * 55)
+    print("\n" + "=" * 60)
     print("🚗  洗车店会员管理系统  🚗")
-    print("=" * 55)
+    print("=" * 60)
     print(" 1. 会员注册")
     print(" 2. 会员充值")
     print(" 3. 预约登记")
     print(" 4. 查看今日预约")
-    print(" 5. 取号排队")
-    print(" 6. 叫号洗车")
-    print(" 7. 完成洗车 & 结算")
-    print(" 8. 查询洗车历史")
-    print(" 9. 每日经营报表")
-    print("10. 导出会员列表(CSV)")
-    print("11. 查看排队状态")
-    print("12. 查看洗车位状态")
+    print(" 5. 预约签到")
+    print(" 6. 取号排队")
+    print(" 7. 叫号洗车")
+    print(" 8. 过号处理 / 恢复过号")
+    print(" 9. 洗车位操作(暂停/继续/延长)")
+    print("10. 完成洗车 & 结算")
+    print("11. 查询洗车历史")
+    print("12. 每日经营报表")
+    print("13. 时间段经营报表")
+    print("14. 导出会员列表(CSV)")
+    print("15. 查看排队状态")
+    print("16. 查看洗车位状态")
     print(" 0. 退出系统")
-    print("=" * 55)
+    print("=" * 60)
 
 
 def _fmt_time(dt):
@@ -578,7 +832,7 @@ def main():
 
     while True:
         display_menu()
-        choice = input("请选择操作 (0-12): ").strip()
+        choice = input("请选择操作 (0-16): ").strip()
 
         if choice == "0":
             print("感谢使用，再见！")
@@ -629,12 +883,22 @@ def main():
             else:
                 print(f"共 {len(reservations)} 条预约：")
                 for i, res in enumerate(reservations, 1):
-                    status_map = {"pending": "待取号", "used": "已使用", "expired": "已过期"}
+                    status_map = {"pending": "待签到", "checked_in": "已签到待取号", "used": "已使用", "no_show": "已过期"}
                     st = status_map.get(res.get("status", "pending"), res.get("status", "未知"))
                     member_mark = "【会员】" if res.get("is_member") else ""
-                    print(f"  {i:2d}. {res['arrival_time'][5:16]} | {res['plate_number']} {member_mark}| {st}")
+                    check_in_time = f" (签到:{res['check_in_time'][11:16]})" if res.get("check_in_time") else ""
+                    print(f"  {i:2d}. {res['arrival_time'][5:16]} | {res['plate_number']} {member_mark}| {st}{check_in_time}")
 
         elif choice == "5":
+            print("\n--- 预约签到 ---")
+            plate = input("请输入预约车牌号签到: ").strip()
+            if not plate:
+                print("车牌号不能为空！")
+                continue
+            success, msg = check_in_reservation(data, plate)
+            print(msg)
+
+        elif choice == "6":
             print("\n--- 取号排队 ---")
             plate = input("请输入车牌号: ").strip()
             if not plate:
@@ -661,7 +925,7 @@ def main():
             else:
                 print(result)
 
-        elif choice == "6":
+        elif choice == "7":
             print("\n--- 叫号洗车 ---")
             success, result = call_next_car(data)
             if success:
@@ -678,13 +942,75 @@ def main():
             else:
                 print(result)
 
-        elif choice == "7":
+        elif choice == "8":
+            print("\n--- 过号处理 / 恢复过号 ---")
+            sub = input("   s=过号处理，r=恢复过号: ").strip().lower()
+            if sub == "s":
+                key = input("   请输入票号或车牌号标记过号: ").strip()
+                ok, msg = skip_called_car(data, key)
+                print(msg)
+                if data["skipped_tickets"]:
+                    print(f"   当前过号列表共 {len(data['skipped_tickets'])} 张：")
+                    for t in data["skipped_tickets"]:
+                        print(f"     票号{t['ticket_number']:03d} {t['plate_number']} (跳过{t.get('skip_count',1)}次)")
+            elif sub == "r":
+                key = input("   请输入票号或车牌号恢复: ").strip()
+                ok, res = restore_skipped_car(data, key)
+                if ok:
+                    priority_cn = {"vip": "VIP", "reserved": "预约", "normal": "普通"}
+                    print(f"✅ 恢复成功！票号{res['ticket_number']:03d} {res['plate_number']}")
+                    print(f"   当前队列第{res['new_position']}位（{priority_cn.get(res['priority'],'普通')}优先级）")
+                    print(f"   前面{res['cars_ahead']}台车，约等{res['wait_minutes']}分钟")
+                else:
+                    print(res)
+            else:
+                print("   未选择操作")
+
+        elif choice == "9":
+            print("\n--- 洗车位操作 ---")
+            statuses = get_bay_status(data)
+            for bs in statuses:
+                if bs["is_busy"]:
+                    state = "⏸暂停" if bs["paused"] else "▶进行中"
+                    extra = f" 已延长+{bs['extra_duration_minutes']}分" if bs["extra_duration_minutes"] else ""
+                    paused = f" 累计暂停{bs['total_paused_minutes']}分" if bs["total_paused_minutes"] else ""
+                    print(f"  {bs['bay_number']}号: {state} | {bs['plate_number']} | 已洗{bs['elapsed_minutes']}分/剩{bs['remaining_minutes']}分{extra}{paused}")
+                else:
+                    print(f"  {bs['bay_number']}号: 空闲 ✅")
+            bay_in = input(f"\n请输入车位号 (1-{WASH_BAYS}): ").strip()
+            try:
+                bay = int(bay_in)
+            except ValueError:
+                print("车位号无效")
+                continue
+            op = input("操作: p=暂停，r=继续，e=延长时长: ").strip().lower()
+            if op == "p":
+                ok, msg = pause_bay(data, bay)
+                print(msg)
+            elif op == "r":
+                ok, msg = resume_bay(data, bay)
+                print(msg)
+            elif op == "e":
+                mins_in = input("请输入延长分钟数: ").strip()
+                try:
+                    mins = int(mins_in)
+                except ValueError:
+                    print("请输入整数分钟数")
+                    continue
+                ok, msg = extend_bay_service(data, bay, mins)
+                print(msg)
+            else:
+                print("未选择有效操作")
+
+        elif choice == "10":
             print("\n--- 完成洗车 & 结算 ---")
             bay_statuses = get_bay_status(data)
             print("当前洗车位状态：")
             for bs in bay_statuses:
                 if bs["is_busy"]:
-                    print(f"  {bs['bay_number']}号: {bs['plate_number']} (已洗{bs['elapsed_minutes']}分/剩{bs['remaining_minutes']}分)")
+                    state = "⏸暂停" if bs["paused"] else "▶进行中"
+                    extra = f" 已延长+{bs['extra_duration_minutes']}分" if bs["extra_duration_minutes"] else ""
+                    print(f"  {bs['bay_number']}号: {bs['plate_number']} {state} (已洗{bs['elapsed_minutes']}分/剩{bs['remaining_minutes']}分){extra}")
                 else:
                     print(f"  {bs['bay_number']}号: 空闲")
             bay_input = input(f"\n请输入完成的洗车位号 (1-{WASH_BAYS}): ").strip()
@@ -715,7 +1041,7 @@ def main():
             else:
                 print(result)
 
-        elif choice == "8":
+        elif choice == "11":
             print("\n--- 查询洗车历史 ---")
             plate = input("请输入车牌号: ").strip()
             history = get_wash_history(data, plate)
@@ -723,13 +1049,13 @@ def main():
                 print("未找到该车辆的洗车记录")
                 continue
             print(f"\n📋  {plate} 最近洗车记录（最近5次）:")
-            print("-" * 55)
+            print("-" * 60)
             for i, record in enumerate(history, 1):
                 member_mark = "会员" if record["is_member"] else "非会员"
                 promotion_mark = "【促销半价】" if record.get("is_promotion") else ""
                 print(f"{i}. {record['wash_time']} | {member_mark} | {record['payment_method']} | {record['price']:.2f}元 {promotion_mark}")
 
-        elif choice == "9":
+        elif choice == "12":
             print("\n--- 每日经营报表 ---")
             date_input = input("请输入日期 (YYYY-MM-DD，默认今天): ").strip()
             report = get_daily_report(data, date_input if date_input else None)
@@ -737,7 +1063,7 @@ def main():
                 print("该日期没有经营数据")
                 continue
             print(f"\n📊  {report['date']} 经营报表")
-            print("-" * 55)
+            print("-" * 60)
             print(f"【洗车台数】")
             print(f"  总台数: {report['total_washes']}")
             print(f"  会员洗车: {report['member_washes']}")
@@ -745,7 +1071,8 @@ def main():
             print(f"\n【收入统计】")
             print(f"  现金收入: {report['cash_income']:.2f} 元")
             print(f"  会员充值: {report['recharge_amount']:.2f} 元")
-            print(f"  当日总收入: {report['total_income']:.2f} 元")
+            print(f"  会员余额消费: {report['member_balance_spent']:.2f} 元")
+            print(f"  当日总收入(现金+充值): {report['total_income']:.2f} 元")
             print(f"\n【优惠与抵扣】")
             print(f"  半价优惠次数: {report['promotion_count']} 次")
             print(f"  会员次数抵扣: {report['wash_credits_used']} 次")
@@ -754,7 +1081,42 @@ def main():
                 for method, amount in report["payment_breakdown"].items():
                     print(f"  {method}: {amount:.2f} 元")
 
-        elif choice == "10":
+        elif choice == "13":
+            print("\n--- 时间段经营报表 ---")
+            today = get_today_str()
+            default_start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+            s = input(f"开始日期 (YYYY-MM-DD，默认近7天 {default_start}): ").strip() or default_start
+            e = input(f"结束日期 (YYYY-MM-DD，默认今天 {today}): ").strip() or today
+            ok, report = get_range_report(data, s, e)
+            if not ok:
+                print(report)
+                continue
+            print(f"\n📊  {report['start_date']} 至 {report['end_date']} 经营汇总")
+            print(f"    共计 {report['days_total']} 天，其中 {report['days_covered']} 天有数据")
+            print("-" * 60)
+            print(f"【洗车台数】")
+            print(f"  总台数: {report['total_washes']}")
+            print(f"  会员洗车: {report['member_washes']}")
+            print(f"  非会员洗车: {report['non_member_washes']}")
+            print(f"\n【收入统计】")
+            print(f"  现金收入: {report['cash_income']:.2f} 元")
+            print(f"  会员充值: {report['recharge_amount']:.2f} 元")
+            print(f"  会员余额消费: {report['member_balance_spent']:.2f} 元")
+            print(f"  总收入(现金+充值): {report['total_income']:.2f} 元")
+            print(f"\n【优惠与抵扣】")
+            print(f"  半价优惠次数: {report['promotion_count']} 次")
+            print(f"  会员次数抵扣: {report['wash_credits_used']} 次")
+            if report["payment_breakdown"]:
+                print(f"\n【支付方式明细(全周期)】")
+                for method, amount in report["payment_breakdown"].items():
+                    print(f"  {method}: {amount:.2f} 元")
+            if report.get("daily_details"):
+                print(f"\n【每日明细】")
+                print(f"  {'日期':12s} {'台数':>5s} {'现金':>10s} {'充值':>10s}")
+                for d in report["daily_details"]:
+                    print(f"  {d['date']:12s} {d['total_washes']:>5d} {d['cash_income']:>10.2f} {d['recharge_amount']:>10.2f}")
+
+        elif choice == "14":
             print("\n--- 导出会员列表 ---")
             filename = input("请输入导出文件名(默认members.csv): ").strip()
             if not filename:
@@ -764,7 +1126,7 @@ def main():
             success, msg = export_members_csv(data, filename)
             print(msg)
 
-        elif choice == "11":
+        elif choice == "15":
             print("\n--- 排队状态 ---")
             total_waiting, wait_minutes = get_wait_time(data)
             vip_c, res_c, norm_c = get_queue_position(data)
@@ -774,6 +1136,10 @@ def main():
                 print(f"  预约排队: {res_c} 人")
             print(f"  普通排队: {norm_c} 人")
             print(f"队尾预计等待: 约 {wait_minutes} 分钟")
+            if data["skipped_tickets"]:
+                print(f"过号未恢复: {len(data['skipped_tickets'])} 张")
+                for t in data["skipped_tickets"]:
+                    print(f"  票号{t['ticket_number']:03d} {t['plate_number']} (跳过{t.get('skip_count',1)}次)")
             if data["queue"]:
                 print("\n排队列表（含每台预计开洗时间）:")
                 for i, item in enumerate(data["queue"], 1):
@@ -789,7 +1155,7 @@ def main():
                         extra = f" | 约{info['wait_minutes']}分钟 → {_fmt_datetime(info['estimated_start'])} (预计{info['assigned_bay']}号)"
                     print(f"  {i:2d}. 票号{item['ticket_number']:03d} {label_str} {item['plate_number']}{extra}")
 
-        elif choice == "12":
+        elif choice == "16":
             print("\n--- 洗车位状态 ---")
             statuses = get_bay_status(data)
             for bs in statuses:
@@ -800,10 +1166,17 @@ def main():
                     if bs.get("is_reservation"):
                         labels.append("预约")
                     label_str = f"【{'/'.join(labels)}】" if labels else ""
+                    state_str = "⏸ 暂停中" if bs["paused"] else "▶ 洗车中"
+                    extra_info = []
+                    if bs["extra_duration_minutes"]:
+                        extra_info.append(f"已延长+{bs['extra_duration_minutes']}分")
+                    if bs["total_paused_minutes"]:
+                        extra_info.append(f"累计暂停{bs['total_paused_minutes']}分")
+                    extra_str = f" ({', '.join(extra_info)})" if extra_info else ""
                     bar_len = 20
                     filled = int(bs["progress_pct"] / 100 * bar_len)
                     bar = "█" * filled + "░" * (bar_len - filled)
-                    print(f"  {bs['bay_number']}号车位: 使用中")
+                    print(f"  {bs['bay_number']}号车位: {state_str}{extra_str}")
                     print(f"     {bs['plate_number']} {label_str} (票号:{bs['ticket_number']:03d})")
                     print(f"     进度: {bar} {bs['progress_pct']}%")
                     print(f"     已洗: {bs['elapsed_minutes']}分钟 | 剩余: {bs['remaining_minutes']}分钟 | 预计结束: {_fmt_time(bs['estimated_end'])}")
